@@ -58,20 +58,14 @@ here.
 
 import datetime
 import os
-import time
-from typing import Generator, Tuple
+from contextlib import ExitStack
+from typing import Dict, Generator, Optional, Tuple
 
 import tensorflow as tf
 from tensorflow_examples.models.pix2pix import pix2pix
 from tqdm import tqdm
 
 # Influential constants
-# Path to the checkpoints
-CHECKPOINT_PATH = "./checkpoints/train"
-# Log and summary output
-CURRENT_TIME = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-TRAIN_LOG_PATH = f"./logs/gradient_tape/{CURRENT_TIME}/train"
-TEST_LOG_PATH = f"./logs/gradient_tape/{CURRENT_TIME}/test"
 # Shuffle buffer size
 BUFFER_SIZE = 1000
 # Penalty coefficient
@@ -256,24 +250,15 @@ class TrainingMetrics:
         self.metric_disc_y_loss = tf.keras.metrics.Mean(
             "total_disc_y_loss", dtype=tf.float32)
 
-    def __call__(
-        self,
-        gen_g_loss: float,
-        gen_f_loss: float,
-        total_cycle_loss: float,
-        total_gen_g_loss: float,
-        total_gen_f_loss: float,
-        disc_x_loss: float,
-        disc_y_loss: float
-    ):
+    def __call__(self, metrics: Dict[str, float]):
         """Update metrics."""
-        self.metric_gen_g_loss(gen_g_loss)
-        self.metric_gen_f_loss(gen_f_loss)
-        self.metric_total_cycle_loss(total_cycle_loss)
-        self.metric_total_gen_g_loss(total_gen_g_loss)
-        self.metric_total_gen_f_loss(total_gen_f_loss)
-        self.metric_disc_x_loss(disc_x_loss)
-        self.metric_disc_y_loss(disc_y_loss)
+        self.metric_gen_g_loss(metrics["gen_g_loss"])
+        self.metric_gen_f_loss(metrics["gen_f_loss"])
+        self.metric_total_cycle_loss(metrics["total_cycle_loss"])
+        self.metric_total_gen_g_loss(metrics["total_gen_g_loss"])
+        self.metric_total_gen_f_loss(metrics["total_gen_f_loss"])
+        self.metric_disc_x_loss(metrics["disc_x_loss"])
+        self.metric_disc_y_loss(metrics["disc_y_loss"])
 
     def put_summary(self, step: int):
         """Put metrics to tf.summary."""
@@ -342,19 +327,25 @@ class CycleGANModel:
         self.discriminator_y_optimizer = tf.keras.optimizers.Adam(
             2e-4, beta_1=0.5)
 
+    def compile(self, *args, **kwargs):
+        """Configure the model for training."""
+        self.generator_g.compile(*args, **kwargs)
+        self.generator_f.compile(*args, **kwargs)
+        self.discriminator_x.compile(*args, **kwargs)
+        self.discriminator_y.compile(*args, **kwargs)
+
     @tf.function
     def train_step(self, real_x: tf.Tensor, real_y: tf.Tensor,
-                   loss_obj: tf.losses.Loss, metrics: TrainingMetrics):
+                   loss_obj: tf.losses.Loss) -> Dict[str, float]:
         """Train step for CycleGAN.
 
-        Even though the training loop looks complicated, it consists of five
+        Even though the training loop looks complicated, it consists of four
         basic steps:
 
         * Get the predictions.
         * Calculate the loss.
         * Calculate the gradients using backpropagation.
         * Apply the gradients to the optimizer.
-        * Save metrics
         """
         # pylint: disable=too-many-locals
         # persistent is set to True because the tape is used more than
@@ -423,54 +414,71 @@ class CycleGANModel:
             zip(discriminator_y_gradients,
                 self.discriminator_y.trainable_variables)
         )
-        # Update metrics
-        metrics(gen_g_loss, gen_f_loss, total_cycle_loss, total_gen_g_loss,
-                total_gen_f_loss, disc_x_loss, disc_y_loss)
+        return {
+            "gen_g_loss": gen_g_loss,
+            "gen_f_loss": gen_f_loss,
+            "total_cycle_loss": total_cycle_loss,
+            "total_gen_g_loss": total_gen_g_loss,
+            "total_gen_f_loss": total_gen_f_loss,
+            "disc_x_loss": disc_x_loss,
+            "disc_y_loss": disc_y_loss
+        }
 
-    def train(self, horses: tf.data.Dataset,
-              zebras: tf.data.Dataset,
-              npairs: int,
-              total_epochs: int,
-              ckpt_manager: tf.train.CheckpointManager,
-              ):
+    def fit(self, horses: tf.data.Dataset,
+            zebras: tf.data.Dataset,
+            *,
+            npairs: Optional[int] = None,
+            epochs: int = 1,
+            ckpt_manager: Optional[tf.train.CheckpointManager] = None,
+            summary_path: Optional[str] = None
+            ):
         """Training process."""
+        loss_obj = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+        print(f"Starting training for {epochs} epochs")
         # Metrics for training summary
         metrics = TrainingMetrics()
-        train_summary_writer = tf.summary.create_file_writer(TRAIN_LOG_PATH)
-        loss_obj = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-        print(f"Starting training for {total_epochs} epochs")
+        if summary_path is not None:
+            train_summary_writer = tf.summary.create_file_writer(summary_path)
         # pylint: disable=not-context-manager
-        with train_summary_writer.as_default():
-            for epoch in range(total_epochs):
-                start = time.time()
-                for image_x, image_y in tqdm(
+        with ExitStack() as stack:
+            if summary_path is not None:
+                stack.enter_context(train_summary_writer.as_default())
+            for epoch in range(epochs):
+                for img_x, img_y in tqdm(
                     tf.data.Dataset.zip((horses, zebras)),
                     total=npairs,
                     unit="img",
-                    desc=f"Epoch {epoch + 1}/{total_epochs}"
+                    desc=f"Epoch {epoch + 1}/{epochs}"
                 ):
-                    self.train_step(
-                        image_x,
-                        image_y,
-                        loss_obj,
-                        metrics
-                    )
-                save_pth = ckpt_manager.save()
-                print(f"Saving checkpoint for epoch {epoch + 1} at {save_pth}")
-                print(f"Took {time.time() - start} s for epoch {epoch + 1}\n")
+                    new_metrics = self.train_step(img_x, img_y, loss_obj)
+                    # Update metrics
+                    metrics(new_metrics)
+                if ckpt_manager is not None:
+                    save_pth = ckpt_manager.save()
+                    print(f"Checkpointed for epoch {epoch + 1} at {save_pth}")
                 # Summaries
-                metrics.put_summary(step=epoch)
-                tf.summary.image(
-                    "Training original and output",
-                    tf.concat(
-                        (sample_horse, self.generator_g(sample_horse)), 0),
-                    max_outputs=2,
-                    step=0
-                )
+                if summary_path is not None:
+                    metrics.put_summary(step=epoch)
+                    tf.summary.image(
+                        "Training original and output",
+                        tf.concat((
+                            sample_horse,
+                            self.generator_g(sample_horse)
+                        ), 0),
+                        max_outputs=2,
+                        step=0)
 
-    def test(self, horses: tf.data.Dataset):
+    def predict(self, horses: tf.Tensor, *args, **kwargs) -> tf.Tensor:
+        """Generate B set predictions for the A set samples."""
+        return self.generator_g.predict(horses, *args, **kwargs)
+
+    def rev_predict(self, zebras: tf.Tensor, *args, **kwargs) -> tf.Tensor:
+        """Generate A set predictions for the B set samples."""
+        return self.generator_f.predict(zebras, *args, **kwargs)
+
+    def test(self, horses: tf.data.Dataset, log_path: str):
         """Generate using test dataset."""
-        test_summary_writer = tf.summary.create_file_writer(TEST_LOG_PATH)
+        test_summary_writer = tf.summary.create_file_writer(log_path)
         horses = horses.map(
             preprocess_image_train, num_parallel_calls=AUTOTUNE
         ).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
@@ -500,7 +508,8 @@ class CycleGANModel:
         self.discriminator_y.load_weights(os.path.join(dirpath, "disy.tf"))
 
 
-def get_checkpoint(cgmodel: CycleGANModel) -> tf.train.CheckpointManager:
+def get_checkpoint(cgmodel: CycleGANModel, path: str
+                   ) -> tf.train.CheckpointManager:
     """Checkpoints."""
     ckpt = tf.train.Checkpoint(
         generator_g=cgmodel.generator_g,
@@ -512,8 +521,7 @@ def get_checkpoint(cgmodel: CycleGANModel) -> tf.train.CheckpointManager:
         discriminator_x_optimizer=cgmodel.discriminator_x_optimizer,
         discriminator_y_optimizer=cgmodel.discriminator_y_optimizer
     )
-    ckpt_manager = tf.train.CheckpointManager(
-        ckpt, CHECKPOINT_PATH, max_to_keep=5)
+    ckpt_manager = tf.train.CheckpointManager(ckpt, path, max_to_keep=5)
     # if a checkpoint exists, restore the latest checkpoint.
     if ckpt_manager.latest_checkpoint:
         ckpt.restore(ckpt_manager.latest_checkpoint)
@@ -528,6 +536,12 @@ HORSE_SET_PATH = "./datasets/photo2clp/trainA"
 ZEBRA_SET_PATH = "./datasets/photo2clp/trainB"
 # Path to the test A set
 HORSE_TEST_PATH = "./datasets/photo2clp/testA"
+# Path to the checkpoints
+CHECKPOINT_PATH = "./checkpoints/train"
+# Log and summary output
+CURRENT_TIME = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+TRAIN_LOG_PATH = f"./logs/gradient_tape/{CURRENT_TIME}/train"
+TEST_LOG_PATH = f"./logs/gradient_tape/{CURRENT_TIME}/test"
 # Path to save the result
 MODEL_PATH = "./models"
 # Number of training epochs
@@ -538,7 +552,8 @@ CACHE = False
 
 if __name__ == "__main__":
     model = CycleGANModel()
-    ckpt_mgr = get_checkpoint(model)
+    model.compile()
+    ckpt_mgr = get_checkpoint(model, CHECKPOINT_PATH)
     # Load dataset
     train_horses, number_train_horses = get_img_dataset(HORSE_SET_PATH)
     train_zebras, number_train_zebras = get_img_dataset(ZEBRA_SET_PATH)
@@ -560,6 +575,13 @@ if __name__ == "__main__":
     train_zebras = train_zebras.map(
         preprocess_image_train, num_parallel_calls=AUTOTUNE
     ).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
-    model.train(train_horses, train_zebras, total_pairs, EPOCHS, ckpt_mgr)
-    model.test(test_horses)
+    model.fit(
+        train_horses,
+        train_zebras,
+        npairs=total_pairs,
+        epochs=EPOCHS,
+        ckpt_manager=ckpt_mgr,
+        summary_path=TRAIN_LOG_PATH
+    )
+    model.test(test_horses, TEST_LOG_PATH)
     model.save(MODEL_PATH)
