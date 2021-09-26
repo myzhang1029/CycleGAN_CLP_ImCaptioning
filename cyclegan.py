@@ -59,6 +59,7 @@ here.
 import datetime
 import os
 from contextlib import ExitStack
+from math import ceil
 from typing import Dict, Generator, Optional, Tuple
 
 import tensorflow as tf
@@ -575,7 +576,7 @@ if __name__ == "__main__":
     model.fit(
         train_horses,
         train_zebras,
-        npairs=total_pairs,
+        npairs=ceil(total_pairs/BATCH_SIZE),
         epochs=EPOCHS,
         ckpt_manager=ckpt_mgr,
         summary_path=TRAIN_LOG_PATH
