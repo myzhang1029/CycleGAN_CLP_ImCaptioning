@@ -438,6 +438,8 @@ class CycleGANModel:
         # Metrics for training summary
         metrics = TrainingMetrics()
         if summary_path is not None:
+            # Pick this one as the sample throughout
+            sample_horse = next(iter(horses))
             train_summary_writer = tf.summary.create_file_writer(summary_path)
         # pylint: disable=not-context-manager
         with ExitStack() as stack:
@@ -559,11 +561,6 @@ if __name__ == "__main__":
     train_zebras, number_train_zebras = get_img_dataset(ZEBRA_SET_PATH)
     total_pairs = min(number_train_horses, number_train_zebras)
     test_horses, _ = get_img_dataset(HORSE_TEST_PATH)
-    # Make it an array of one image
-    sample_horse = tf.expand_dims(
-        preprocess_image_train(next(iter(train_horses))),
-        axis=0
-    )
     # Large memory usage
     if CACHE:
         train_horses = train_horses.cache()
