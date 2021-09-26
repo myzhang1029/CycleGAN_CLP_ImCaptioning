@@ -96,7 +96,7 @@ AUTOTUNE = tf.data.AUTOTUNE
 #   i.e left to right.
 
 image_tensor = tf.TensorSpec(
-    shape=[1, IMG_WIDTH, IMG_HEIGHT, OUTPUT_CHANNELS],
+    shape=[BATCH_SIZE, IMG_WIDTH, IMG_HEIGHT, OUTPUT_CHANNELS],
     dtype=tf.float32
 )
 
