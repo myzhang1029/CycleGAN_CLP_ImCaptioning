@@ -101,6 +101,17 @@ AUTOTUNE = tf.data.AUTOTUNE
 # * In random mirroring, the image is randomly flipped horizontally
 #   i.e left to right.
 
+image_tensor = tf.TensorSpec(
+    shape=[1, IMG_WIDTH, IMG_HEIGHT, OUTPUT_CHANNELS],
+    dtype=tf.float32
+)
+
+any_image_tensor = tf.TensorSpec(
+    shape=[None, None, None],
+    dtype=tf.uint8
+)
+
+
 def imgen(
     directory: bytes,
     suffix: bytes = b".jpg"
@@ -134,28 +145,24 @@ def get_img_dataset(
     return dataset, number
 
 
-def normalize(image: tf.Tensor) -> tf.Tensor:
-    """Normalize the images to [-1, 1]."""
-    image = tf.cast(image, tf.float32)
-    image = (image / 127.5) - 1
-    return image
+@tf.function(input_signature=(any_image_tensor,))
+def preprocess_image_train(image: tf.Tensor) -> tf.Tensor:
+    """Preprocess step for training images.
 
-
-def random_jitter(image: tf.Tensor) -> tf.Tensor:
-    """Resize to 286 x 286 x 3."""
+    1. Resize to 286 x 286 x 3.
+    2. Randomly crop to 256 x 256 x 3.
+    3. Randomly flip.
+    4. Normalize the images to [-1, 1].
+    """
     image = tf.image.resize(image, [286, 286],
                             method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
     # randomly cropping to 256 x 256 x 3
     image = tf.image.random_crop(image, size=[IMG_HEIGHT, IMG_WIDTH, 3])
     # random mirroring
     image = tf.image.random_flip_left_right(image)
-    return image
-
-
-def preprocess_image_train(image: tf.Tensor) -> tf.Tensor:
-    """Preprocess step for training images."""
-    image = random_jitter(image)
-    image = normalize(image)
+    # normalize
+    image = tf.cast(image, tf.float32)
+    image = (image / 127.5) - 1
     return image
 
 # ## Loss functions
@@ -169,6 +176,7 @@ def preprocess_image_train(image: tf.Tensor) -> tf.Tensor:
 # [pix2pix](https://www.tensorflow.org/tutorials/generative/pix2pix).
 
 
+@tf.function
 def discriminator_loss(
     loss_obj: tf.losses.Loss, real: tf.Tensor, generated: tf.Tensor
 ) -> float:
@@ -179,11 +187,13 @@ def discriminator_loss(
     return total_disc_loss * 0.5
 
 
+@tf.function
 def generator_loss(loss_obj: tf.losses.Loss, generated: tf.Tensor) -> float:
     """Generator loss function."""
     return loss_obj(tf.ones_like(generated), generated)
 
 
+@tf.function(input_signature=(image_tensor, image_tensor))
 def calc_cycle_loss(real_image: tf.Tensor, cycled_image: tf.Tensor) -> float:
     r"""Cycle consistency loss.
 
@@ -209,6 +219,7 @@ def calc_cycle_loss(real_image: tf.Tensor, cycled_image: tf.Tensor) -> float:
     return LAMBDA * loss1
 
 
+@tf.function(input_signature=(image_tensor, image_tensor))
 def identity_loss(real_image: tf.Tensor, same_image: tf.Tensor) -> float:
     r"""Identity loss function.
 
@@ -435,6 +446,7 @@ class CycleGANModel:
                 for image_x, image_y in tqdm(
                     tf.data.Dataset.zip((horses, zebras)),
                     total=npairs,
+                    unit="img",
                     desc=f"Epoch {epoch + 1}/{total_epochs}"
                 ):
                     self.train_step(
