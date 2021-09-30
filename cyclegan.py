@@ -63,19 +63,203 @@ from math import ceil
 from typing import Dict, Generator, Optional, Tuple
 
 import tensorflow as tf
-from tensorflow_examples.models.pix2pix import pix2pix
+from tensorflow import Tensor
 from tqdm import tqdm
 
 # Influential constants
-# Shuffle buffer size
-BUFFER_SIZE = 1000
 # Penalty coefficient
 LAMBDA = 10
-BATCH_SIZE = 1
 IMG_WIDTH = 256
 IMG_HEIGHT = 256
 OUTPUT_CHANNELS = 3
-AUTOTUNE = tf.data.AUTOTUNE
+
+
+# ## Pix2pix implementations
+
+class InstanceNormalization(tf.keras.layers.Layer):
+    """Instance Normalization Layer (https://arxiv.org/abs/1607.08022)."""
+
+    def __init__(self, epsilon: float = 1e-5):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def build(self, input_shape: tuple):
+        """Create the variables of the layer."""
+        self.scale = self.add_weight(
+            name="scale",
+            shape=input_shape[-1:],
+            initializer=tf.random_normal_initializer(1., 0.02),
+            trainable=True)
+        self.offset = self.add_weight(
+            name="offset",
+            shape=input_shape[-1:],
+            initializer="zeros",
+            trainable=True)
+
+    def call(self, x: Tensor) -> Tensor:
+        """Instance normalization."""
+        mean, variance = tf.nn.moments(x, axes=[1, 2], keepdims=True)
+        inv = tf.math.rsqrt(variance + self.epsilon)
+        normalized = (x - mean) * inv
+        return self.scale * normalized + self.offset
+
+    def get_config(self):
+        """Get configuration for save and reload."""
+        return {"epsilon": self.epsilon}
+
+
+def downsample(filters: int, size: int, apply_norm: bool = True):
+    """Downsamples an input.
+
+    Conv2D => Batchnorm => LeakyRelu
+    The type of normalization is always instancenorm.
+
+    Parameters
+    ----------
+      filters : int
+        Number of filters
+      size : int
+        Filter size
+      apply_norm : bool
+        If True, adds the instancenorm layer
+
+    Returns
+    -------
+      Downsample Sequential Model
+    """
+    initializer = tf.random_normal_initializer(0., 0.02)
+    result = tf.keras.Sequential()
+    result.add(
+        tf.keras.layers.Conv2D(filters, size, strides=2, padding="same",
+                               kernel_initializer=initializer, use_bias=False))
+    if apply_norm:
+        result.add(InstanceNormalization())
+    result.add(tf.keras.layers.LeakyReLU())
+    return result
+
+
+def upsample(filters: int, size: int, apply_dropout: bool = False):
+    """Upsamples an input.
+
+    Conv2DTranspose => Batchnorm => Dropout => Relu
+    The type of normalization is always instancenorm.
+
+    Parameters
+    ----------
+      filters : int
+        Number of filters,
+      size : int
+        Filter size.
+      apply_dropout : bool, optional
+        If True, adds the dropout layer.
+
+    Returns
+    -------
+    Model
+        Upsample Sequential Model
+    """
+    initializer = tf.random_normal_initializer(0., 0.02)
+    result = tf.keras.Sequential()
+    result.add(
+        tf.keras.layers.Conv2DTranspose(filters, size, strides=2,
+                                        padding="same",
+                                        kernel_initializer=initializer,
+                                        use_bias=False))
+    result.add(InstanceNormalization())
+    if apply_dropout:
+        result.add(tf.keras.layers.Dropout(0.5))
+    result.add(tf.keras.layers.ReLU())
+    return result
+
+
+def unet_generator(output_channels: int) -> tf.keras.Model:
+    """Modified u-net generator model (https://arxiv.org/abs/1611.07004).
+
+    The type of normalization is always instancenorm.
+
+    Parameters
+    ----------
+      output_channels : int
+        Output channels
+
+    Returns:
+      Generator model
+    """
+    down_stack = [
+        downsample(64, 4, apply_norm=False),  # (bs, 128, 128, 64)
+        downsample(128, 4),  # (bs, 64, 64, 128)
+        downsample(256, 4),  # (bs, 32, 32, 256)
+        downsample(512, 4),  # (bs, 16, 16, 512)
+        downsample(512, 4),  # (bs, 8, 8, 512)
+        downsample(512, 4),  # (bs, 4, 4, 512)
+        downsample(512, 4),  # (bs, 2, 2, 512)
+        downsample(512, 4),  # (bs, 1, 1, 512)
+    ]
+    up_stack = [
+        upsample(512, 4, apply_dropout=True),  # (bs, 2, 2, 1024)
+        upsample(512, 4, apply_dropout=True),  # (bs, 4, 4, 1024)
+        upsample(512, 4, apply_dropout=True),  # (bs, 8, 8, 1024)
+        upsample(512, 4),  # (bs, 16, 16, 1024)
+        upsample(256, 4),  # (bs, 32, 32, 512)
+        upsample(128, 4),  # (bs, 64, 64, 256)
+        upsample(64, 4),  # (bs, 128, 128, 128)
+    ]
+    initializer = tf.random_normal_initializer(0., 0.02)
+    last = tf.keras.layers.Conv2DTranspose(
+        output_channels, 4, strides=2,
+        padding="same", kernel_initializer=initializer,
+        activation="tanh")  # (bs, 256, 256, 3)
+    concat = tf.keras.layers.Concatenate()
+    inputs = tf.keras.layers.Input(shape=[None, None, 3])
+    save_inputs = inputs
+    # Downsampling through the model
+    skips = []
+    for downsampler in down_stack:
+        inputs = downsampler(inputs)
+        skips.append(inputs)
+    # Reversed from the second last
+    skips = skips[-2::-1]
+    # Upsampling and establishing the skip connections
+    for upsampler, skip in zip(up_stack, skips):
+        inputs = upsampler(inputs)
+        inputs = concat([inputs, skip])
+    inputs = last(inputs)
+    return tf.keras.Model(inputs=save_inputs, outputs=inputs)
+
+
+def discriminator() -> tf.keras.Model:
+    """PatchGan discriminator model (https://arxiv.org/abs/1611.07004).
+
+    The type of normalization is always instancenorm.
+    The target image cannot be an input.
+
+    Returns:
+      Discriminator model
+    """
+    initializer = tf.random_normal_initializer(0., 0.02)
+    inputs = tf.keras.layers.Input(shape=[None, None, 3], name="input_image")
+    save_inputs = inputs
+    # (bs, 128, 128, 64)
+    down1 = downsample(64, 4, False)(inputs)
+    # (bs, 64, 64, 128)
+    down2 = downsample(128, 4)(down1)
+    # (bs, 32, 32, 256)
+    down3 = downsample(256, 4)(down2)
+    # (bs, 34, 34, 256)
+    zero_pad1 = tf.keras.layers.ZeroPadding2D()(down3)
+    # (bs, 31, 31, 512)
+    conv = tf.keras.layers.Conv2D(
+        512, 4, strides=1, kernel_initializer=initializer,
+        use_bias=False)(zero_pad1)
+    norm1 = InstanceNormalization()(conv)
+    leaky_relu = tf.keras.layers.LeakyReLU()(norm1)
+    # (bs, 33, 33, 512)
+    zero_pad2 = tf.keras.layers.ZeroPadding2D()(leaky_relu)
+    # (bs, 30, 30, 1)
+    last = tf.keras.layers.Conv2D(
+        1, 4, strides=1,
+        kernel_initializer=initializer)(zero_pad2)
+    return tf.keras.Model(inputs=save_inputs, outputs=last)
 
 
 # ## Input Pipeline
@@ -96,8 +280,9 @@ AUTOTUNE = tf.data.AUTOTUNE
 # * In random mirroring, the image is randomly flipped horizontally
 #   i.e left to right.
 
+# shape[0] is batch size, but batch size may not divide the total size
 image_tensor = tf.TensorSpec(
-    shape=[BATCH_SIZE, IMG_WIDTH, IMG_HEIGHT, OUTPUT_CHANNELS],
+    shape=[None, IMG_WIDTH, IMG_HEIGHT, OUTPUT_CHANNELS],
     dtype=tf.float32
 )
 
@@ -110,7 +295,7 @@ any_image_tensor = tf.TensorSpec(
 def imgen(
     directory: bytes,
     suffix: bytes = b".jpg"
-) -> Generator[tf.Tensor, None, None]:
+) -> Generator[Tensor, None, None]:
     """Generate images from a directory of images."""
     assert isinstance(directory, bytes)
     for file in os.scandir(directory):
@@ -141,7 +326,7 @@ def get_img_dataset(
 
 
 @tf.function(input_signature=(any_image_tensor,))
-def preprocess_image_train(image: tf.Tensor) -> tf.Tensor:
+def preprocess_image_train(image: Tensor) -> Tensor:
     """Preprocess step for training images.
 
     1. Resize to 286 x 286 x 3.
@@ -149,7 +334,7 @@ def preprocess_image_train(image: tf.Tensor) -> tf.Tensor:
     3. Randomly flip.
     4. Normalize the images to [-1, 1].
     """
-    image = tf.image.resize(image, [286, 286],
+    image = tf.image.resize(image, [IMG_HEIGHT * 1.12, IMG_WIDTH * 1.12],
                             method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
     # randomly cropping to 256 x 256 x 3
     image = tf.image.random_crop(image, size=[IMG_HEIGHT, IMG_WIDTH, 3])
@@ -173,8 +358,8 @@ def preprocess_image_train(image: tf.Tensor) -> tf.Tensor:
 
 @tf.function
 def discriminator_loss(
-    loss_obj: tf.losses.Loss, real: tf.Tensor, generated: tf.Tensor
-) -> float:
+    loss_obj: tf.losses.Loss, real: Tensor, generated: Tensor
+) -> Tensor:
     """Discriminator loss function."""
     real_loss = loss_obj(tf.ones_like(real), real)
     generated_loss = loss_obj(tf.zeros_like(generated), generated)
@@ -183,13 +368,13 @@ def discriminator_loss(
 
 
 @tf.function
-def generator_loss(loss_obj: tf.losses.Loss, generated: tf.Tensor) -> float:
+def generator_loss(loss_obj: tf.losses.Loss, generated: Tensor) -> Tensor:
     """Generator loss function."""
     return loss_obj(tf.ones_like(generated), generated)
 
 
 @tf.function(input_signature=(image_tensor, image_tensor))
-def calc_cycle_loss(real_image: tf.Tensor, cycled_image: tf.Tensor) -> float:
+def calc_cycle_loss(real_image: Tensor, cycled_image: Tensor) -> Tensor:
     r"""Cycle consistency loss.
 
     Cycle consistency means the result should be close to the original input.
@@ -215,7 +400,7 @@ def calc_cycle_loss(real_image: tf.Tensor, cycled_image: tf.Tensor) -> float:
 
 
 @tf.function(input_signature=(image_tensor, image_tensor))
-def identity_loss(real_image: tf.Tensor, same_image: tf.Tensor) -> float:
+def identity_loss(real_image: Tensor, same_image: Tensor) -> Tensor:
     r"""Identity loss function.
 
     As shown above, generator $G$ is responsible for translating image $X$ to
@@ -283,18 +468,10 @@ class CycleGANModel:
     """Encapsulated model."""
 
     def __init__(self):
-        # ## Import and reuse the Pix2Pix models
-        # Import the generator and the discriminator used in
-        # [Pix2Pix](https://github.com/tensorflow/examples/blob/master/tensorflow_examples/models/pix2pix/pix2pix.py)
-        # via the installed
-        # [tensorflow_examples](https://github.com/tensorflow/examples)
-        # package.
-        #
-        # The model architecture used in this tutorial is very similar to what was used
-        # in [pix2pix](https://github.com/tensorflow/examples/blob/master/tensorflow_examples/models/pix2pix/pix2pix.py).
+        # ## Reuse the Pix2Pix models
         # Some of the differences are:
         #
-        # * Cyclegan uses
+        # * CycleGAN uses
         #   [instance normalization](https://arxiv.org/abs/1607.08022) instead
         #   of [batch normalization](https://arxiv.org/abs/1502.03167).
         # * The [CycleGAN paper](https://arxiv.org/abs/1703.10593) uses a
@@ -312,15 +489,14 @@ class CycleGANModel:
         #   generated image `X` (`F(Y)`).
         # * Discriminator `D_Y` learns to differentiate between image `Y` and
         #   generated image `Y` (`G(X)`).
-        self.generator_g = pix2pix.unet_generator(
-            OUTPUT_CHANNELS, norm_type="instancenorm")
-        self.generator_f = pix2pix.unet_generator(
-            OUTPUT_CHANNELS, norm_type="instancenorm")
-        self.discriminator_x = pix2pix.discriminator(
-            norm_type="instancenorm", target=False)
-        self.discriminator_y = pix2pix.discriminator(
-            norm_type="instancenorm", target=False)
-        # Initialize the optimizers for all the generators and discriminators.
+        self.generator_g = unet_generator(OUTPUT_CHANNELS)
+        self.generator_f = unet_generator(OUTPUT_CHANNELS)
+        self.discriminator_x = discriminator()
+        self.discriminator_y = discriminator()
+        self._init_optimizers()
+
+    def _init_optimizers(self):
+        """Initialize optimizers for all generators and discriminators."""
         self.generator_g_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
         self.generator_f_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
         self.discriminator_x_optimizer = tf.keras.optimizers.Adam(
@@ -336,7 +512,7 @@ class CycleGANModel:
         self.discriminator_y.compile(*args, **kwargs)
 
     @tf.function
-    def train_step(self, real_x: tf.Tensor, real_y: tf.Tensor,
+    def train_step(self, real_x: Tensor, real_y: Tensor,
                    loss_obj: tf.losses.Loss) -> Dict[str, float]:
         """Train step for CycleGAN.
 
@@ -438,27 +614,24 @@ class CycleGANModel:
         print(f"Starting training for {epochs} epochs")
         # Metrics for training summary
         metrics = TrainingMetrics()
-        if summary_path is not None:
-            # Pick this one as the sample throughout
-            sample_horse = next(iter(horses))
-            train_summary_writer = tf.summary.create_file_writer(summary_path)
-        # pylint: disable=not-context-manager
         with ExitStack() as stack:
             if summary_path is not None:
+                # Pick this one as the sample throughout
+                sample_horse = next(iter(horses))
+                train_summary_writer = tf.summary.create_file_writer(
+                    summary_path)
                 stack.enter_context(train_summary_writer.as_default())
             for epoch in range(epochs):
                 for img_x, img_y in tqdm(
                     tf.data.Dataset.zip((horses, zebras)),
                     total=npairs,
-                    unit="img",
+                    unit="batch",
                     desc=f"Epoch {epoch + 1}/{epochs}"
                 ):
-                    new_metrics = self.train_step(img_x, img_y, loss_obj)
                     # Update metrics
-                    metrics(new_metrics)
+                    metrics(self.train_step(img_x, img_y, loss_obj))
                 if ckpt_manager is not None:
-                    save_pth = ckpt_manager.save()
-                    print(f"Checkpointed for epoch {epoch + 1} at {save_pth}")
+                    ckpt_manager.save()
                 # Summaries
                 if summary_path is not None:
                     metrics.put_summary(step=epoch)
@@ -468,33 +641,15 @@ class CycleGANModel:
                             sample_horse,
                             self.generator_g(sample_horse)
                         ), 0),
-                        max_outputs=2,
-                        step=0)
+                        step=epoch)
 
-    def predict(self, horses: tf.Tensor, *args, **kwargs) -> tf.Tensor:
+    def predict(self, *args, **kwargs) -> Tensor:
         """Generate B set predictions for the A set samples."""
-        return self.generator_g.predict(horses, *args, **kwargs)
+        return self.generator_g.predict(*args, **kwargs)
 
-    def rev_predict(self, zebras: tf.Tensor, *args, **kwargs) -> tf.Tensor:
+    def rev_predict(self, *args, **kwargs) -> Tensor:
         """Generate A set predictions for the B set samples."""
-        return self.generator_f.predict(zebras, *args, **kwargs)
-
-    def test(self, horses: tf.data.Dataset, log_path: str):
-        """Generate using test dataset."""
-        test_summary_writer = tf.summary.create_file_writer(log_path)
-        horses = horses.map(
-            preprocess_image_train, num_parallel_calls=AUTOTUNE
-        ).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
-        # Run the trained model on the test dataset
-        # pylint: disable=not-context-manager
-        with test_summary_writer.as_default():
-            for inp in horses.take(5):
-                tf.summary.image(
-                    "Test original and output",
-                    tf.concat((inp, self.generator_g(inp)), 0),
-                    max_outputs=2,
-                    step=0
-                )
+        return self.generator_f.predict(*args, **kwargs)
 
     def save(self, dirpath: str):
         """Save the model. `dirpath` must be a directory."""
@@ -549,6 +704,10 @@ TEST_LOG_PATH = f"./logs/gradient_tape/{CURRENT_TIME}/test"
 MODEL_PATH = "./models"
 # Number of training epochs
 EPOCHS = 40
+# Shuffle buffer size
+BUFFER_SIZE = 1000
+# Size of training batches
+BATCH_SIZE = 1
 # Whether to cache or not (large memory required)
 CACHE = False
 
@@ -561,17 +720,16 @@ if __name__ == "__main__":
     train_horses, number_train_horses = get_img_dataset(HORSE_SET_PATH)
     train_zebras, number_train_zebras = get_img_dataset(ZEBRA_SET_PATH)
     total_pairs = min(number_train_horses, number_train_zebras)
-    test_horses, _ = get_img_dataset(HORSE_TEST_PATH)
     # Large memory usage
     if CACHE:
         train_horses = train_horses.cache()
         train_zebras = train_zebras.cache()
     # Preprocess
     train_horses = train_horses.map(
-        preprocess_image_train, num_parallel_calls=AUTOTUNE
+        preprocess_image_train, num_parallel_calls=tf.data.AUTOTUNE
     ).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
     train_zebras = train_zebras.map(
-        preprocess_image_train, num_parallel_calls=AUTOTUNE
+        preprocess_image_train, num_parallel_calls=tf.data.AUTOTUNE
     ).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
     model.fit(
         train_horses,
@@ -581,5 +739,19 @@ if __name__ == "__main__":
         ckpt_manager=ckpt_mgr,
         summary_path=TRAIN_LOG_PATH
     )
-    model.test(test_horses, TEST_LOG_PATH)
+    # Run the trained model on the test dataset
+    test_summary_writer = tf.summary.create_file_writer(TEST_LOG_PATH)
+    test_horses, _ = get_img_dataset(HORSE_TEST_PATH)
+    test_horses = test_horses.map(
+        preprocess_image_train, num_parallel_calls=tf.data.AUTOTUNE
+    ).shuffle(BUFFER_SIZE).batch(BATCH_SIZE).take(5)
+    # pylint: disable=not-context-manager
+    with test_summary_writer.as_default():
+        for inp in test_horses:
+            tf.summary.image(
+                "Test original and output",
+                tf.concat((inp, model.predict(inp)), 0),
+                max_outputs=2,
+                step=0
+            )
     model.save(MODEL_PATH)
