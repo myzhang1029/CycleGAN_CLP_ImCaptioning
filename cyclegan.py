@@ -17,7 +17,8 @@
 
 """Generic TensorFlow v2 CycleGAN Implementation.
 
-Mostly based on https://www.tensorflow.org/tutorials/generative/cyclegan,
+Mostly based on https://www.tensorflow.org/tutorials/generative/cyclegan
+and https://www.tensorflow.org/tutorials/generative/pix2pix,
 with my interpretations and understanding.
 
 This notebook demonstrates unpaired image to image translation using
@@ -60,10 +61,11 @@ import datetime
 import os
 from contextlib import ExitStack
 from math import ceil
-from typing import Dict, Generator, Optional, Tuple
+from typing import Any, Dict, Generator, Optional, Tuple
 
 import tensorflow as tf
 from tensorflow import Tensor
+from tensorflow.keras import Model
 from tqdm import tqdm
 
 # Influential constants
@@ -83,7 +85,7 @@ class InstanceNormalization(tf.keras.layers.Layer):
         super().__init__()
         self.epsilon = epsilon
 
-    def build(self, input_shape: tuple):
+    def build(self, input_shape: Tuple[int, ...]) -> None:
         """Create the variables of the layer."""
         self.scale = self.add_weight(
             name="scale",
@@ -103,12 +105,12 @@ class InstanceNormalization(tf.keras.layers.Layer):
         normalized = (x - mean) * inv
         return self.scale * normalized + self.offset
 
-    def get_config(self):
+    def get_config(self) -> Dict[str, float]:
         """Get configuration for save and reload."""
         return {"epsilon": self.epsilon}
 
 
-def downsample(filters: int, size: int, apply_norm: bool = True):
+def downsample(filters: int, size: int, apply_norm: bool = True) -> Model:
     """Downsamples an input.
 
     Conv2D => Batchnorm => LeakyRelu
@@ -138,7 +140,7 @@ def downsample(filters: int, size: int, apply_norm: bool = True):
     return result
 
 
-def upsample(filters: int, size: int, apply_dropout: bool = False):
+def upsample(filters: int, size: int, apply_dropout: bool = False) -> Model:
     """Upsamples an input.
 
     Conv2DTranspose => Batchnorm => Dropout => Relu
@@ -172,7 +174,7 @@ def upsample(filters: int, size: int, apply_dropout: bool = False):
     return result
 
 
-def unet_generator(output_channels: int) -> tf.keras.Model:
+def unet_generator(output_channels: int) -> Model:
     """Modified u-net generator model (https://arxiv.org/abs/1611.07004).
 
     The type of normalization is always instancenorm.
@@ -224,10 +226,10 @@ def unet_generator(output_channels: int) -> tf.keras.Model:
         inputs = upsampler(inputs)
         inputs = concat([inputs, skip])
     inputs = last(inputs)
-    return tf.keras.Model(inputs=save_inputs, outputs=inputs)
+    return Model(inputs=save_inputs, outputs=inputs)
 
 
-def discriminator() -> tf.keras.Model:
+def discriminator() -> Model:
     """PatchGan discriminator model (https://arxiv.org/abs/1611.07004).
 
     The type of normalization is always instancenorm.
@@ -259,7 +261,7 @@ def discriminator() -> tf.keras.Model:
     last = tf.keras.layers.Conv2D(
         1, 4, strides=1,
         kernel_initializer=initializer)(zero_pad2)
-    return tf.keras.Model(inputs=save_inputs, outputs=last)
+    return Model(inputs=save_inputs, outputs=last)
 
 
 # ## Input Pipeline
@@ -420,7 +422,7 @@ def identity_loss(real_image: Tensor, same_image: Tensor) -> Tensor:
 class TrainingMetrics:
     """Encapsulated metrics for this project."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.metric_gen_g_loss = tf.keras.metrics.Mean(
             "gen_g_loss", dtype=tf.float32)
         self.metric_gen_f_loss = tf.keras.metrics.Mean(
@@ -436,7 +438,7 @@ class TrainingMetrics:
         self.metric_disc_y_loss = tf.keras.metrics.Mean(
             "total_disc_y_loss", dtype=tf.float32)
 
-    def __call__(self, metrics: Dict[str, float]):
+    def __call__(self, metrics: Dict[str, float]) -> None:
         """Update metrics."""
         self.metric_gen_g_loss(metrics["gen_g_loss"])
         self.metric_gen_f_loss(metrics["gen_f_loss"])
@@ -446,7 +448,7 @@ class TrainingMetrics:
         self.metric_disc_x_loss(metrics["disc_x_loss"])
         self.metric_disc_y_loss(metrics["disc_y_loss"])
 
-    def put_summary(self, step: int):
+    def put_summary(self, step: int) -> None:
         """Put metrics to tf.summary."""
         tf.summary.scalar("Forward Generator Loss",
                           self.metric_gen_g_loss.result(), step=step)
@@ -467,7 +469,7 @@ class TrainingMetrics:
 class CycleGANModel:
     """Encapsulated model."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         # ## Reuse the Pix2Pix models
         # Some of the differences are:
         #
@@ -495,7 +497,7 @@ class CycleGANModel:
         self.discriminator_y = discriminator()
         self._init_optimizers()
 
-    def _init_optimizers(self):
+    def _init_optimizers(self) -> None:
         """Initialize optimizers for all generators and discriminators."""
         self.generator_g_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
         self.generator_f_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
@@ -504,7 +506,7 @@ class CycleGANModel:
         self.discriminator_y_optimizer = tf.keras.optimizers.Adam(
             2e-4, beta_1=0.5)
 
-    def compile(self, *args, **kwargs):
+    def compile(self, *args: Any, **kwargs: Any) -> None:
         """Configure the model for training."""
         self.generator_g.compile(*args, **kwargs)
         self.generator_f.compile(*args, **kwargs)
@@ -608,7 +610,7 @@ class CycleGANModel:
             epochs: int = 1,
             ckpt_manager: Optional[tf.train.CheckpointManager] = None,
             summary_path: Optional[str] = None
-            ):
+            ) -> None:
         """Training process."""
         loss_obj = tf.keras.losses.BinaryCrossentropy(from_logits=True)
         print(f"Starting training for {epochs} epochs")
@@ -643,22 +645,22 @@ class CycleGANModel:
                         ), 0),
                         step=epoch)
 
-    def predict(self, *args, **kwargs) -> Tensor:
+    def predict(self, *args: Any, **kwargs: Any) -> Tensor:
         """Generate B set predictions for the A set samples."""
         return self.generator_g.predict(*args, **kwargs)
 
-    def rev_predict(self, *args, **kwargs) -> Tensor:
+    def rev_predict(self, *args: Any, **kwargs: Any) -> Tensor:
         """Generate A set predictions for the B set samples."""
         return self.generator_f.predict(*args, **kwargs)
 
-    def save(self, dirpath: str):
+    def save(self, dirpath: str) -> None:
         """Save the model. `dirpath` must be a directory."""
         self.generator_g.save_weights(os.path.join(dirpath, "geng.tf"))
         self.generator_f.save_weights(os.path.join(dirpath, "genf.tf"))
         self.discriminator_x.save_weights(os.path.join(dirpath, "disx.tf"))
         self.discriminator_y.save_weights(os.path.join(dirpath, "disy.tf"))
 
-    def load(self, dirpath: str):
+    def load(self, dirpath: str) -> None:
         """Reload a model. `dirpath` must be a directory."""
         self.generator_g.load_weights(os.path.join(dirpath, "geng.tf"))
         self.generator_f.load_weights(os.path.join(dirpath, "genf.tf"))
